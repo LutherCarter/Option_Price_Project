@@ -27,8 +27,9 @@ The architecture separates data preparation from computation to maximize speed:
 ### **Step 1: Generate the Market Data**
 
 Create a .env file in the project root and add your Polygon API key:
-
 POLYGON\_API\_KEY=your\_key\_here
+
+Or download the .env file contained in the repository and add your Polygon API key.
 
 Run the data loader to fetch the options chain and generate the data.csv file:
 
@@ -38,7 +39,7 @@ python Data\_Loader.py
 
 Compile the engine with maximum performance optimizations (-O3):
 
-g++ \-std=c++17 \-O3 \-pthread Option\_Price\_1.0.cpp \-o engine
+g++ \-std=c++17 \-O3 \-pthread Option\_Pricer.cpp \-o engine
 
 ### **Step 3: Run the Engine**
 
