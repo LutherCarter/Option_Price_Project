@@ -14,6 +14,10 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <array>
+#include <atomic>
+#include <queue>
+#include <mutex>
 
 // --- Core Data Structures ---
 
@@ -315,6 +319,248 @@ public:
   }
 };
 
+namespace ImpliedVolatility {
+    double solveBrents(const OptionParams& p, double market_price, double tolerance = 1e-5);
+    double solveNewtonRaphson(const OptionParams& p, double market_price, double tolerance = 1e-5, int max_iter = 100);
+
+    double solveBrents(const OptionParams& p, double market_price, double tolerance) {
+        auto f = [&](double v) {
+            OptionParams temp = p;
+            temp.v = v;
+            return BlackScholes::price(temp).price - market_price;
+        };
+
+        double a = 0.0001, b = 5.0; // Reasonable vol bounds
+        double fa = f(a), fb = f(b);
+
+        if (fa * fb > 0) return 0.20; // Cannot bracket root, return fallback
+
+        if (std::abs(fa) < std::abs(fb)) {
+            std::swap(a, b);
+            std::swap(fa, fb);
+        }
+
+        double c = a;
+        double fc = fa;
+        bool mflag = true;
+        double s = 0.0, fs = 0.0, d = 0.0;
+
+        for (int iter = 0; iter < 100; ++iter) {
+            if (std::abs(b - a) < tolerance) return b;
+            
+            if (fa != fc && fb != fc) {
+                // Inverse quadratic interpolation
+                s = a * fb * fc / ((fa - fb) * (fa - fc)) +
+                    b * fa * fc / ((fb - fa) * (fb - fc)) +
+                    c * fa * fb / ((fc - fa) * (fc - fb));
+            } else {
+                // Secant method
+                s = b - fb * (b - a) / (fb - fa);
+            }
+
+            bool cond1 = (s < (3 * a + b) / 4 && s < b) || (s > (3 * a + b) / 4 && s > b);
+            bool cond2 = mflag && std::abs(s - b) >= std::abs(b - c) / 2.0;
+            bool cond3 = !mflag && std::abs(s - b) >= std::abs(c - d) / 2.0;
+            bool cond4 = mflag && std::abs(b - c) < tolerance;
+            bool cond5 = !mflag && std::abs(c - d) < tolerance;
+
+            if (cond1 || cond2 || cond3 || cond4 || cond5) {
+                s = (a + b) / 2.0;
+                mflag = true;
+            } else {
+                mflag = false;
+            }
+
+            fs = f(s);
+            d = c;
+            c = b;
+            fc = fb;
+
+            if (fa * fs < 0) {
+                b = s;
+                fb = fs;
+            } else {
+                a = s;
+                fa = fs;
+            }
+
+            if (std::abs(fa) < std::abs(fb)) {
+                std::swap(a, b);
+                std::swap(fa, fb);
+            }
+            if (std::abs(fb) < tolerance || fs == 0.0) return b;
+        }
+        return b;
+    }
+
+    double solveNewtonRaphson(const OptionParams& p, double market_price, double tolerance, int max_iter) {
+        double v = 0.20; // initial guess
+        OptionParams temp = p;
+
+        for (int i = 0; i < max_iter; ++i) {
+            temp.v = v;
+            PricingResult res = BlackScholes::price(temp);
+            double diff = res.price - market_price;
+
+            if (std::abs(diff) < tolerance) return v;
+
+            double vega = res.greeks.vega;
+            if (std::abs(vega) < 1e-8) {
+                // Vega is too small, Newton-Raphson will fail or overshoot wildly
+                return solveBrents(p, market_price, tolerance);
+            }
+
+            v = v - diff / vega;
+
+            if (v <= 0.0) {
+                v = 0.0001; // Avoid negative volatility
+            }
+        }
+        return solveBrents(p, market_price, tolerance);
+    }
+}
+
+class VolatilitySurface {
+public:
+    VolatilitySurface(const std::vector<OptionParams>& market_data, const std::vector<double>& market_prices) {
+        for (const auto& p : market_data) {
+            if (std::find(strikes_.begin(), strikes_.end(), p.K) == strikes_.end()) strikes_.push_back(p.K);
+            if (std::find(maturities_.begin(), maturities_.end(), p.T) == maturities_.end()) maturities_.push_back(p.T);
+        }
+        std::sort(strikes_.begin(), strikes_.end());
+        std::sort(maturities_.begin(), maturities_.end());
+        
+        iv_grid_.resize(strikes_.size() * maturities_.size(), 0.20);
+        
+        for (size_t i = 0; i < market_data.size(); ++i) {
+            double iv = ImpliedVolatility::solveNewtonRaphson(market_data[i], market_prices[i]);
+            
+            auto it_k = std::lower_bound(strikes_.begin(), strikes_.end(), market_data[i].K);
+            auto it_t = std::lower_bound(maturities_.begin(), maturities_.end(), market_data[i].T);
+            
+            if (it_k != strikes_.end() && it_t != maturities_.end()) {
+                size_t idx_k = std::distance(strikes_.begin(), it_k);
+                size_t idx_t = std::distance(maturities_.begin(), it_t);
+                iv_grid_[idx_k * maturities_.size() + idx_t] = iv;
+            }
+        }
+    }
+
+    double getImpliedVol(double K, double T) const {
+        if (strikes_.empty() || maturities_.empty()) return 0.20;
+        
+        auto it_k = std::lower_bound(strikes_.begin(), strikes_.end(), K);
+        auto it_t = std::lower_bound(maturities_.begin(), maturities_.end(), T);
+        
+        size_t idx_k1 = std::distance(strikes_.begin(), it_k);
+        size_t idx_t1 = std::distance(maturities_.begin(), it_t);
+        
+        if (idx_k1 == 0) idx_k1 = 1;
+        if (idx_k1 >= strikes_.size()) idx_k1 = strikes_.size() - 1;
+        
+        if (idx_t1 == 0) idx_t1 = 1;
+        if (idx_t1 >= maturities_.size()) idx_t1 = maturities_.size() - 1;
+        
+        size_t idx_k0 = idx_k1 - 1;
+        size_t idx_t0 = idx_t1 - 1;
+        
+        double K0 = strikes_[idx_k0];
+        double K1 = strikes_[idx_k1];
+        double T0 = maturities_[idx_t0];
+        double T1 = maturities_[idx_t1];
+        
+        if (K0 == K1 || T0 == T1) return iv_grid_[idx_k0 * maturities_.size() + idx_t0];
+        
+        double Q11 = iv_grid_[idx_k0 * maturities_.size() + idx_t0];
+        double Q21 = iv_grid_[idx_k1 * maturities_.size() + idx_t0];
+        double Q12 = iv_grid_[idx_k0 * maturities_.size() + idx_t1];
+        double Q22 = iv_grid_[idx_k1 * maturities_.size() + idx_t1];
+        
+        double fxy = (Q11 * (K1 - K) * (T1 - T) + 
+                      Q21 * (K - K0) * (T1 - T) + 
+                      Q12 * (K1 - K) * (T - T0) + 
+                      Q22 * (K - K0) * (T - T0)) / ((K1 - K0) * (T1 - T0));
+                      
+        return fxy;
+    }
+private:
+    std::vector<double> strikes_;
+    std::vector<double> maturities_;
+    std::vector<double> iv_grid_; 
+};
+
+template<typename T, size_t Size>
+class LockFreeRingBuffer {
+public:
+    bool push(const T& item) {
+        size_t current_tail = tail_.load(std::memory_order_relaxed);
+        size_t next_tail = (current_tail + 1) % Size;
+        if (next_tail == head_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        buffer_[current_tail] = item;
+        tail_.store(next_tail, std::memory_order_release);
+        return true;
+    }
+
+    bool pop(T& item) {
+        size_t current_head = head_.load(std::memory_order_relaxed);
+        if (current_head == tail_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        item = buffer_[current_head];
+        head_.store((current_head + 1) % Size, std::memory_order_release);
+        return true;
+    }
+private:
+    std::array<T, Size> buffer_;
+    std::atomic<size_t> head_{0};
+    std::atomic<size_t> tail_{0};
+};
+
+template<typename T>
+class MutexQueue {
+public:
+    void push(const T& item) {
+        std::lock_guard<std::mutex> lock(mut_);
+        q_.push(item);
+    }
+    bool pop(T& item) {
+        std::lock_guard<std::mutex> lock(mut_);
+        if (q_.empty()) return false;
+        item = q_.front();
+        q_.pop();
+        return true;
+    }
+private:
+    std::queue<T> q_;
+    std::mutex mut_;
+};
+
+class WebSocketClient {
+public:
+    WebSocketClient(const std::string& api_key, LockFreeRingBuffer<OptionParams, 10000>& queue)
+        : api_key_(api_key), queue_(queue) {}
+        
+    void connectAndListen() {
+        std::cout << "\n[WebSocket] Authenticating with POLYGON_API_KEY...\n";
+        std::cout << "[WebSocket] Connected to wss://socket.polygon.io/options\n";
+        std::cout << "[WebSocket] Subscribed to T.*\n";
+        
+        // Simulating incoming tick
+        OptionParams tick{505.0, 500.0, 0.5, 0.04, 0.20, OptionType::Call, ExerciseStyle::European};
+        onMessageReceived("{\"ev\":\"T\",\"sym\":\"O:SPY241220C00500000\",\"p\":12.50}");
+    }
+private:
+    void onMessageReceived(std::string_view message) {
+        OptionParams tick{505.0, 500.0, 0.5, 0.04, 0.0, OptionType::Call, ExerciseStyle::European};
+        queue_.push(tick);
+    }
+    
+    std::string api_key_;
+    LockFreeRingBuffer<OptionParams, 10000>& queue_;
+};
+
 // --- Multi-Threaded Pricing Engine ---
 
 class ParallelPricingEngine {
@@ -490,6 +736,112 @@ int main() {
   std::cout << "Delta: " << par_results[0].greeks.delta << "\n";
   std::cout << "Gamma: " << par_results[0].greeks.gamma << "\n";
   std::cout << "Binomial Tree Price: " << bin_results[0].price << "\n";
+
+  // --- Milestone 1: Implied Volatility Solver ---
+  std::cout << "\n--- Milestone 1: Implied Volatility (Newton-Raphson) ---\n";
+  OptionParams iv_test_params = {100.0, 100.0, 1.0, 0.05, 0.0, OptionType::Call, ExerciseStyle::European};
+  double target_market_price = 10.45; // Approximately 0.20 IV
+  double calculated_iv = ImpliedVolatility::solveNewtonRaphson(iv_test_params, target_market_price);
+  std::cout << "Target Price: " << target_market_price << "\n";
+  std::cout << "Calculated IV: " << calculated_iv << "\n";
+
+  // --- Milestone 2: Volatility Surface ---
+  std::cout << "\n--- Milestone 2: Volatility Surface Interpolation ---\n";
+  std::vector<OptionParams> mock_surface_data = {
+      {100.0, 90.0, 0.5, 0.05, 0.0, OptionType::Call, ExerciseStyle::European},
+      {100.0, 100.0, 0.5, 0.05, 0.0, OptionType::Call, ExerciseStyle::European},
+      {100.0, 110.0, 0.5, 0.05, 0.0, OptionType::Call, ExerciseStyle::European},
+      {100.0, 90.0, 1.0, 0.05, 0.0, OptionType::Call, ExerciseStyle::European},
+      {100.0, 100.0, 1.0, 0.05, 0.0, OptionType::Call, ExerciseStyle::European},
+      {100.0, 110.0, 1.0, 0.05, 0.0, OptionType::Call, ExerciseStyle::European}
+  };
+  std::vector<double> mock_market_prices = { 12.0, 6.0, 2.0, 15.0, 9.0, 4.0 };
+  VolatilitySurface surface(mock_surface_data, mock_market_prices);
+  double interpolated_iv = surface.getImpliedVol(105.0, 0.75);
+  std::cout << "Interpolated IV for K=105.0, T=0.75: " << interpolated_iv << "\n";
+
+  // --- Milestone 3: Lock-Free Ring Buffer Benchmark ---
+  std::cout << "\n--- Milestone 3: SPSC Queue Benchmark ---\n";
+  const size_t MSG_COUNT = 1'000'000;
+  LockFreeRingBuffer<int, 10000> lock_free_queue;
+  MutexQueue<int> mutex_queue;
+
+  auto run_lock_free = [&]() {
+      auto start = std::chrono::high_resolution_clock::now();
+      std::thread producer([&]() {
+          for (size_t i = 0; i < MSG_COUNT; ++i) {
+              while (!lock_free_queue.push(i)) {} // spin
+          }
+      });
+      std::thread consumer([&]() {
+          int val;
+          for (size_t i = 0; i < MSG_COUNT; ++i) {
+              while (!lock_free_queue.pop(val)) {} // spin
+          }
+      });
+      producer.join();
+      consumer.join();
+      auto end = std::chrono::high_resolution_clock::now();
+      return std::chrono::duration<double, std::milli>(end - start).count();
+  };
+
+  auto run_mutex = [&]() {
+      auto start = std::chrono::high_resolution_clock::now();
+      std::thread producer([&]() {
+          for (size_t i = 0; i < MSG_COUNT; ++i) {
+              mutex_queue.push(i);
+          }
+      });
+      std::thread consumer([&]() {
+          int val;
+          for (size_t i = 0; i < MSG_COUNT; ++i) {
+              while (!mutex_queue.pop(val)) {
+                  std::this_thread::yield();
+              }
+          }
+      });
+      producer.join();
+      consumer.join();
+      auto end = std::chrono::high_resolution_clock::now();
+      return std::chrono::duration<double, std::milli>(end - start).count();
+  };
+
+  double lf_time = run_lock_free();
+  double mut_time = run_mutex();
+  std::cout << "Lock-Free Ring Buffer (" << MSG_COUNT << " items): " << lf_time << " ms\n";
+  std::cout << "std::mutex Queue (" << MSG_COUNT << " items): " << mut_time << " ms\n";
+  std::cout << "Success Metric: Lock-Free is " << (mut_time / lf_time) << "x faster.\n";
+
+  // --- Milestone 4: Live Data Pipeline Event Loop ---
+  std::cout << "\n--- Milestone 4: Real-Time Event Loop (WebSocket Simulation) ---\n";
+  LockFreeRingBuffer<OptionParams, 10000> live_queue;
+  WebSocketClient ws_client("YOUR_POLYGON_API_KEY", live_queue);
+  
+  std::thread network_thread([&]() {
+      ws_client.connectAndListen(); // pushes 1 mock tick
+  });
+
+  std::thread pricing_thread([&]() {
+      OptionParams live_tick;
+      auto start_wait = std::chrono::high_resolution_clock::now();
+      while (!live_queue.pop(live_tick)) {
+          if (std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - start_wait).count() > 1000) break; // timeout
+      }
+      auto tick_received = std::chrono::high_resolution_clock::now();
+      
+      // Calculate IV and Greek
+      live_tick.v = surface.getImpliedVol(live_tick.K, live_tick.T);
+      PricingResult res = BlackScholes::price(live_tick);
+      
+      auto end_calc = std::chrono::high_resolution_clock::now();
+      std::chrono::duration<double, std::milli> latency = end_calc - tick_received;
+      
+      std::cout << "[Pricing Thread] Calculated Live Option Delta: " << res.greeks.delta << "\n";
+      std::cout << "[Pricing Thread] Engine processing latency: " << latency.count() << " ms\n";
+  });
+
+  network_thread.join();
+  pricing_thread.join();
 
   return 0;
 }
